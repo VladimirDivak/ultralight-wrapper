@@ -1,22 +1,23 @@
 #include <Ultralight/Ultralight.h>
+#include <JavaScriptCore/JavaScript.h>
 #include <AppCore/Platform.h>
 #include <iostream>
 #include <string>
 #include <fstream>
-// #include "GPUDriverD3D11.h"
-// #include "GPUContextD3D11.h"
+#include <vector>
 
 using namespace ultralight;
 
 typedef void (*DebugLogCallback)(const char *message);
+typedef void (*JavaScriptEvent)(const char *eventName, const char *args);
 
-class UnityLogger : public Logger
+class CustomLogger : public Logger
 {
     DebugLogCallback g_DebugLogCallback;
     std::string logPath;
 
 public:
-    UnityLogger(DebugLogCallback callback)
+    CustomLogger(DebugLogCallback callback)
     {
         logPath = "D:\\ultralight.log";
         g_DebugLogCallback = callback;
@@ -45,23 +46,26 @@ public:
         else
         {
             std::string error_msg = "Failed to open log file: " + logPath;
-            g_DebugLogCallback(error_msg.c_str());
+            if (g_DebugLogCallback)
+                g_DebugLogCallback(error_msg.c_str());
         }
 
-        g_DebugLogCallback(message.utf8().data());
+        if (g_DebugLogCallback)
+            g_DebugLogCallback(message.utf8().data());
     }
 
-    ~UnityLogger()
+    ~CustomLogger()
     {
         g_DebugLogCallback = nullptr;
     }
 };
-class UnityViewListener : public ViewListener
+
+class CustomViewListener : public ViewListener
 {
     DebugLogCallback g_DebugLogCallback;
 
 public:
-    UnityViewListener(DebugLogCallback callback)
+    CustomViewListener(DebugLogCallback callback)
     {
         g_DebugLogCallback = callback;
     }
@@ -80,40 +84,114 @@ public:
         }
     }
 
-    ~UnityViewListener()
+    ~CustomViewListener()
     {
         g_DebugLogCallback = nullptr;
     }
 };
 
+class CustomLoadListener : public LoadListener
+{
+    static JavaScriptEvent javascript_event;
+
+    static JSValueRef OnSendMessageToEngineWithArgs(JSContextRef ctx, JSObjectRef function,
+                                            JSObjectRef thisObject, size_t argumentCount,
+                                            const JSValueRef arguments[], JSValueRef *exception)
+    {
+        if (!javascript_event)
+        {
+            if (exception)
+            {
+                *exception = JSValueMakeString(ctx, JSStringCreateWithUTF8CString("JavaScript event callback is not set."));
+            }
+            return JSValueMakeNull(ctx);
+        }
+
+        if (argumentCount < 1 || argumentCount > 2)
+        {
+            if (exception)
+            {
+                *exception = JSValueMakeString(ctx, JSStringCreateWithUTF8CString("Invalid number of arguments."));
+            }
+            return JSValueMakeNull(ctx);
+        }
+
+        JSStringRef jsString = JSValueToStringCopy(ctx, arguments[0], exception);
+        size_t bufferSize = JSStringGetMaximumUTF8CStringSize(jsString);
+        std::vector<char> message(bufferSize);
+        JSStringGetUTF8CString(jsString, message.data(), bufferSize);
+        JSStringRelease(jsString);
+
+        std::string args;
+        if (argumentCount == 2)
+        {
+            JSStringRef jsArgString = JSValueToStringCopy(ctx, arguments[1], exception);
+            size_t argBufferSize = JSStringGetMaximumUTF8CStringSize(jsArgString);
+            std::vector<char> argBuffer(argBufferSize);
+            JSStringGetUTF8CString(jsArgString, argBuffer.data(), argBufferSize);
+            args = std::string(argBuffer.data());
+            JSStringRelease(jsArgString);
+        }
+
+        javascript_event(message.data(), args.empty() ? nullptr : args.c_str());
+        
+        return JSValueMakeNull(ctx);
+    }
+
+public:
+    CustomLoadListener(JavaScriptEvent callback)
+    {
+        javascript_event = callback;
+    }
+
+    void UpdateCallback(JavaScriptEvent callback)
+    {
+        javascript_event = callback;
+    }
+
+    virtual void OnDOMReady(View *caller, uint64_t frame_id, bool is_main_frame, const String &url) override
+    {
+        auto scoped_context = caller->LockJSContext();
+        JSContextRef ctx = (*scoped_context);
+        JSStringRef name = JSStringCreateWithUTF8CString("sendMessageToEngine");
+        JSObjectRef func = JSObjectMakeFunctionWithCallback(ctx, name, OnSendMessageToEngineWithArgs);
+        JSObjectRef globalObj = JSContextGetGlobalObject(ctx);
+        JSObjectSetProperty(ctx, globalObj, name, func, 0, nullptr);
+        JSStringRelease(name);
+    }
+
+    ~CustomLoadListener()
+    {
+        javascript_event = nullptr;
+    }
+};
+
+JavaScriptEvent CustomLoadListener::javascript_event = nullptr;
+
 RefPtr<Renderer> renderer;
 RefPtr<View> view;
 
-UnityLogger *logger;
-UnityViewListener *view_listener;
-
-// GPUContextD3D11 *gpu_context;
-// GPUDriverD3D11 *gpu_driver;
+CustomLogger *logger;
+CustomViewListener *view_listener;
+CustomLoadListener *load_listener;
 
 static int x, y;
 static bool isInitialized;
 
 extern "C"
 {
-    __declspec(dllexport) void ULInitialize(const char *path, const char *cache, DebugLogCallback callback)
+    __declspec(dllexport) void ULInitialize(const char *path, const char *cache, DebugLogCallback callback, JavaScriptEvent js_event_callback)
     {
         if (!isInitialized)
         {
-            logger = new UnityLogger(callback);
-            view_listener = new UnityViewListener(callback);
-            // gpu_context = new GPUContextD3D11();
-            // gpu_driver = new GPUDriverD3D11(gpu_context);
+            logger = new CustomLogger(callback);
+            view_listener = new CustomViewListener(callback);
+            load_listener = new CustomLoadListener(js_event_callback);
 
             Config config;
             config.cache_path = cache;
             config.user_stylesheet = "body { background: transparent; }";
 
-            // Platform::instance().set_gpu_driver(gpu_driver);
             Platform::instance().set_config(config);
             Platform::instance().set_logger(logger);
             Platform::instance().set_font_loader(GetPlatformFontLoader());
@@ -123,6 +201,7 @@ extern "C"
         {
             logger->UpdateCallback(callback);
             view_listener->UpdateCallback(callback);
+            load_listener->UpdateCallback(js_event_callback);
         }
     }
 
@@ -135,28 +214,19 @@ extern "C"
             ViewConfig view_config;
             view_config.is_transparent = true;
             view_config.enable_javascript = true;
-            // view_config.is_accelerated = true;
 
             view = renderer->CreateView(width, height, view_config, nullptr);
             view->set_view_listener(view_listener);
-
-            view->LoadURL(url);
+            view->set_load_listener(load_listener);
         }
-        else view->Reload();
+
+        view->LoadURL(url);
     }
 
     __declspec(dllexport) void ULUpdate()
     {
         renderer->Update();
-        // gpu_driver->BeginSynchronize();
-
         renderer->Render();
-        // gpu_driver->EndSynchronize();
-
-        // if (gpu_driver->HasCommandsPending())
-        // {
-        //     gpu_driver->DrawCommandList();
-        // }
     }
 
     __declspec(dllexport) void ULRefresh()
@@ -183,6 +253,21 @@ extern "C"
         view->FireMouseEvent(mouse_event);
     }
 
+    __declspec(dllexport) void ULSetScroll(int power)
+    {
+        ScrollEvent scroll_event;
+        scroll_event.type = ScrollEvent::kType_ScrollByPixel;
+        scroll_event.delta_x = 0;
+        scroll_event.delta_y = power;
+
+        view->FireScrollEvent(scroll_event);
+    }
+
+    __declspec(dllexport) void ULInvokeJavaScript(const char *data)
+    {
+        view->EvaluateScript(data);
+    }
+
     __declspec(dllexport) void ULSetMouseDown()
     {
         MouseEvent mouse_event;
@@ -204,12 +289,6 @@ extern "C"
 
         view->FireMouseEvent(mouse_event);
     }
-
-    // __declspec(dllexport) void *ULGet2DTexture()
-    // {
-    //     RenderTarget render_target = view->render_target();
-    //     return nullptr;
-    // }
 
     __declspec(dllexport) void *ULCopyBitmapToTexture()
     {
@@ -237,12 +316,34 @@ extern "C"
         }
     }
 
-    __declspec(dllexport) void ULDispose()
+    __declspec(dllexport) void ULReset()
     {
+        logger->UpdateCallback(nullptr);
+        view_listener->UpdateCallback(nullptr);
+        load_listener->UpdateCallback(nullptr);
+
         x = 0;
         y = 0;
 
         if (!isInitialized)
             isInitialized = true;
+    }
+
+    __declspec(dllexport) void ULDispose()
+    {
+        view.reset();
+        view = nullptr;
+
+        renderer.reset();
+        renderer = nullptr;
+
+        // delete logger;
+        // logger = nullptr;
+
+        // delete view_listener;
+        // view_listener = nullptr;
+
+        // delete load_listener;
+        // load_listener = nullptr;
     }
 }
